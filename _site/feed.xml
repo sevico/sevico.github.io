@@ -1,0 +1,522 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title></title>
+    <description></description>
+    <link>/</link>
+    <atom:link href="/feed.xml" rel="self" type="application/rss+xml"/>
+    <pubDate>Sat, 17 Aug 2019 18:46:29 +0800</pubDate>
+    <lastBuildDate>Sat, 17 Aug 2019 18:46:29 +0800</lastBuildDate>
+    <generator>Jekyll v3.1.6</generator>
+    
+      <item>
+        <title>分析Linux系统调用</title>
+        <description>&lt;p&gt;在不同类型的操作系统上，系统调用都是内核给用户态的应用程序提供操作原语最主要的方式。虽然Linux内核在此基础上还有其他的途径来给用户程序提供一些接口(例如proc文件系统，netlink)，但也或多或少地依赖了系统调用。所以对Linux系统调用的实现进行分析，打开这个黑盒子，能进一步了解其底层实现，进而将一些操作系统概念与真实世界的实作联系起来，甚至能发现许多手册上没有提到，或者表述不清的地方(毕竟手册上的东西更多表述的是抽象接口)！况且，这件事本身也非常有意思！&lt;/p&gt;
+
+&lt;p&gt;首先，你不能分析一个你看不见的东西。而在Linux内核的较高版本上，已经将通过宏定义的方式来声明系统调用。
+老版本(2.6.24)如下：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;asmlinkage unsigned long sys_alarm(unsigned int seconds)
+{
+	return alarm_setitimer(seconds);
+}
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;而在较高(4.4)版本的源码中，已变为:&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;SYSCALL_DEFINE1(alarm, unsigned int, seconds)
+{
+	return alarm_setitimer(seconds);
+}
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;这样的形式。&lt;/p&gt;
+
+&lt;p&gt;其中的SYSCALL_DEFINE1是用于生成只有一个参数的系统调用声明，该宏展开后所对应的代码形式类似于老版本的样子。&lt;/p&gt;
+
+&lt;p&gt;虽然这样做在软件工程的角度讲可以将系统调用的声明方式归拢到一处(宏定义处)，但这阻碍了很多代码分析工具(source insight,visual studio code)对系统调用的正常识别：会将系统调用当成一个宏的参数，而不是一个函数。这样会影响我们对系统调用实现函数的定位。&lt;/p&gt;
+
+&lt;p&gt;我目前对该问题的解决方案是，利用这些系统调用声明宏都是以&lt;code class=&quot;highlighter-rouge&quot;&gt;SYSCALL_DEFINE&lt;/code&gt;开头的特点，通过文本编辑器(如sublime text)或者grep来在Linux内核项目中找到所有&lt;code class=&quot;highlighter-rouge&quot;&gt;SYSCALL_DEFINE&lt;/code&gt;出现的地方，就可以定位到所有系统调用声明处了(虽然会有些不是地方，例如文档中，但极少)。如果你有更好的方法，欢迎留言探讨。&lt;/p&gt;
+
+&lt;p&gt;例如用grep来完成的命令是：&lt;code class=&quot;highlighter-rouge&quot;&gt;grep -rn SYSCALL_DEFINE ./&lt;/code&gt;
+执行部分结果大致如下：&lt;/p&gt;
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;./kernel/time/itimer.c:103:SYSCALL_DEFINE2(getitimer, int, which, struct itimerval __user *, value)
+./kernel/time/itimer.c:278:SYSCALL_DEFINE3(setitimer, int, which, struct itimerval __user *, value,
+./kernel/time/posix-timers.c:607:SYSCALL_DEFINE3(timer_create, const clockid_t, which_clock,
+./kernel/time/posix-timers.c:781:SYSCALL_DEFINE2(timer_gettime, timer_t, timer_id,
+./kernel/time/posix-timers.c:817:SYSCALL_DEFINE1(timer_getoverrun, timer_t, timer_id)
+./kernel/time/posix-timers.c:885:SYSCALL_DEFINE4(timer_settime, timer_t, timer_id, int, flags,
+./kernel/time/posix-timers.c:948:SYSCALL_DEFINE1(timer_delete, timer_t, timer_id)
+...
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;从其中可以看到&lt;code class=&quot;highlighter-rouge&quot;&gt;getitimer&lt;/code&gt;(kernel/time/itimer.c文件中的103行)等系统调用的定义位置。注：我的代码因为加了我自己的一些注释，可能会和你搜索的结果不同。&lt;/p&gt;
+
+&lt;p&gt;我把这个命令的输出重定向到文件中，方便查阅系统调用的定义位置。算是对代码分析工具的一个补充吧。&lt;/p&gt;
+
+&lt;p&gt;至于用来实现这些系统调用的实现函数，则大多可以通过代码分析工具定位到，方便进行进一步分析。&lt;/p&gt;
+
+&lt;p&gt;有了这个命令的执行结果，加上一个趁手的代码阅读工具，就可以继续进行系统调用的分析了。&lt;/p&gt;
+
+&lt;p&gt;在本系列文章中，将会聚焦于系统调用的具体实现，站在内核的角度进行描述，假定用户程序已经通过某种机制将系统调用要用到的参数传递到内核中。暂时不会讲述与系统调用实现相关的体系结构相关的知识，例如如何传递调用参数，如何进行特权级切换等。虽然这些内容同样非常重要，但十分依赖具体的硬件架构，而且网上也有很多不错的相关资料。后面如有需要，会加以补充x86-64平台上的实现方式。&lt;/p&gt;
+
+&lt;p&gt;在接下来的文章中，我会具体从易到难地讲述每个系统调用的实现方式。对涉及更下层次的具体实现(例如VFS方面)，本系列文章会暂时&lt;code class=&quot;highlighter-rouge&quot;&gt;浅尝辄止&lt;/code&gt;,不会深入进去。而会另开一些列文章进行叙述。保证这一些列文章都在一个大致相似的实现层次。&lt;/p&gt;
+
+&lt;p&gt;在本系列文章的写作中，势必会引用很多书籍，网上的资料。在此先提前感谢！&lt;/p&gt;
+
+&lt;p&gt;如有任何疑问，欢迎留言反馈。也可以给我发email:2927098@qq.com&lt;/p&gt;
+</description>
+        <pubDate>Sat, 17 Aug 2019 16:50:45 +0800</pubDate>
+        <link>/%E5%88%86%E6%9E%90Linux%E7%B3%BB%E7%BB%9F%E8%B0%83%E7%94%A8(1)/</link>
+        <guid isPermaLink="true">/%E5%88%86%E6%9E%90Linux%E7%B3%BB%E7%BB%9F%E8%B0%83%E7%94%A8(1)/</guid>
+        
+        
+        <category>Linux</category>
+        
+      </item>
+    
+      <item>
+        <title>Welcome to Jekyll!</title>
+        <description>&lt;p&gt;You’ll find this post in your &lt;code class=&quot;highlighter-rouge&quot;&gt;_posts&lt;/code&gt; directory. Go ahead and edit it and re-build the site to see your changes. You can rebuild the site in many different ways, but the most common way is to run &lt;code class=&quot;highlighter-rouge&quot;&gt;jekyll serve&lt;/code&gt;, which launches a web server and auto-regenerates your site when a file is updated.&lt;/p&gt;
+
+&lt;p&gt;To add new posts, simply add a file in the &lt;code class=&quot;highlighter-rouge&quot;&gt;_posts&lt;/code&gt; directory that follows the convention &lt;code class=&quot;highlighter-rouge&quot;&gt;YYYY-MM-DD-name-of-post.ext&lt;/code&gt; and includes the necessary front matter. Take a look at the source for this post to get an idea about how it works.&lt;/p&gt;
+
+&lt;p&gt;Jekyll also offers powerful support for code snippets:&lt;/p&gt;
+
+&lt;figure class=&quot;highlight&quot;&gt;&lt;pre&gt;&lt;code class=&quot;language-ruby&quot; data-lang=&quot;ruby&quot;&gt;&lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;print_hi&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+  &lt;span class=&quot;nb&quot;&gt;puts&lt;/span&gt; &lt;span class=&quot;s2&quot;&gt;&quot;Hi, &lt;/span&gt;&lt;span class=&quot;si&quot;&gt;#{&lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;si&quot;&gt;}&lt;/span&gt;&lt;span class=&quot;s2&quot;&gt;&quot;&lt;/span&gt;
+&lt;span class=&quot;k&quot;&gt;end&lt;/span&gt;
+&lt;span class=&quot;n&quot;&gt;print_hi&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s1&quot;&gt;&#39;Tom&#39;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+&lt;span class=&quot;c1&quot;&gt;#=&amp;gt; prints &#39;Hi, Tom&#39; to STDOUT.&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/figure&gt;
+
+&lt;p&gt;Check out the &lt;a href=&quot;http://jekyllrb.com/docs/home&quot;&gt;Jekyll docs&lt;/a&gt; for more info on how to get the most out of Jekyll. File all bugs/feature requests at &lt;a href=&quot;https://github.com/jekyll/jekyll&quot;&gt;Jekyll’s GitHub repo&lt;/a&gt;. If you have questions, you can ask them on &lt;a href=&quot;https://talk.jekyllrb.com/&quot;&gt;Jekyll Talk&lt;/a&gt;.&lt;/p&gt;
+
+</description>
+        <pubDate>Sat, 17 Aug 2019 16:28:45 +0800</pubDate>
+        <link>/welcome-to-jekyll/</link>
+        <guid isPermaLink="true">/welcome-to-jekyll/</guid>
+        
+        
+        <category>jekyll</category>
+        
+        <category>update</category>
+        
+      </item>
+    
+      <item>
+        <title>LOFFER文档</title>
+        <description>&lt;p&gt;LOFFER是个可以帮助你get off from LOFTER的软件（我知道这个pun很烂）。&lt;/p&gt;
+
+&lt;p&gt;这是一个可以通过Fork直接发布在GitHub的Jekyll博客，你不需要编写代码或使用命令行即可获得一个部署在GitHub的博客。&lt;/p&gt;
+
+&lt;p&gt;当你看到不认识的术语，请忽略它，我知道程序员不说人话，我都不是程序员但是我已经开始意识到这是因为我们不知道这些概念用人话怎么说。&lt;/p&gt;
+
+&lt;p&gt;以下我会尽量用人话解说如何使用这个……LOFFER。&lt;/p&gt;
+
+&lt;h2 id=&quot;注意&quot;&gt;注意&lt;/h2&gt;
+
+&lt;p&gt;LOFFER是一个&lt;strong&gt;博客模板&lt;/strong&gt;，使用GitHub Pages发布个人博客是没有任何问题的。 &lt;strong&gt;但是:&lt;/strong&gt;&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;&lt;strong&gt;请勿发布成人向内容&lt;/strong&gt;&lt;/li&gt;
+  &lt;li&gt;&lt;strong&gt;不要将大量图片上传到GitHub&lt;/strong&gt;&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;如有疑问，请阅读&lt;a href=&quot;https://pages.github.com/&quot;&gt;GitHub Pages官方说明&lt;/a&gt;。&lt;/p&gt;
+
+&lt;p&gt;另外，同人作品更好的发布平台是&lt;a href=&quot;https://archiveofourown.org/&quot;&gt;AO3&lt;/a&gt;，你想你发在AO3还有tag还有kudos还有人看，是吧？&lt;/p&gt;
+
+&lt;h2 id=&quot;如何使用&quot;&gt;如何使用&lt;/h2&gt;
+
+&lt;p&gt;首先，这个博客主题适应手机阅读，但是，要使用它建立你自己的博客，你需要上电脑操作。&lt;/p&gt;
+
+&lt;h3 id=&quot;第一步-fork到你的github&quot;&gt;第一步 Fork到你的GitHub&lt;/h3&gt;
+
+&lt;p&gt;请点击&lt;a href=&quot;https://github.com/&quot;&gt;GitHub&lt;/a&gt;，注册一个GitHub账户。我们可以理解Git就是个文件版本管理系统，本身并不需要会代码即可使用。&lt;/p&gt;
+
+&lt;p&gt;现在你看到的LOFFER，是作为一个GitHub上的Repository（代码库）存在的，你可以把这个代码库复制到你自己的GitHub账户中，这个操作叫做Fork。&lt;/p&gt;
+
+&lt;p&gt;点击&lt;a href=&quot;https://github.com/FromEndWorld/LOFFER&quot;&gt;LOFFER&lt;/a&gt;，进入LOFFER的GitHub Repository页面，然后点Fork：&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;https://raw.githubusercontent.com/FromEndWorld/LOFFER/master/images/fork.gif&quot; alt=&quot;gif&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;然后你立刻就可以看到LOFFER再次出现，这次它已经属于你了，这里我建议你重命名它，点击settings，给你的博客起个名字（请尽量使用字母而非中文）。&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;https://raw.githubusercontent.com/FromEndWorld/LOFFER/master/images/rename.png&quot; alt=&quot;img&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;然后，向下拉页面，你会看到“GitHub Pages”，这是GitHub内置的网站host服务，选择master，如图所示：&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;https://raw.githubusercontent.com/FromEndWorld/LOFFER/master/images/pages.png&quot; alt=&quot;img&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;在几秒钟后，刷新此页面，你通常会看到这个绿色的东西（如果没看到，多等一会），你的网站已经发布成功，点击这个链接，即可查看：&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;https://raw.githubusercontent.com/FromEndWorld/LOFFER/master/images/published.png&quot; alt=&quot;img&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;你可能会看到网站长得很丑，请继续下一步.&lt;/p&gt;
+
+&lt;h3 id=&quot;第二步-设置站点信息&quot;&gt;第二步 设置站点信息&lt;/h3&gt;
+
+&lt;p&gt;在你的博客的GitHub代码库页面里，选择Code，文件列表里选择_config.yml，点击打开，点击右上角笔形图标修改文档。&lt;/p&gt;
+
+&lt;p&gt;修改完成后，点击“Commit changes”。每次修改过代码库并且commit后，GitHub Pages都会自动重新发布网站，只要等上几分钟，再次刷新你的博客页面，就会看到你的修改了。&lt;/p&gt;
+
+&lt;p&gt;还有一点，&lt;strong&gt;LOFFER使用的是MIT协议，大意就是全部开源随意使用，如果你要保留自己博文的权利，请编辑LICENSE文件，写上类似“_posts中的文档作者保留权利”这样的内容。&lt;/strong&gt;&lt;/p&gt;
+
+&lt;h3 id=&quot;第三步-发布博文&quot;&gt;第三步 发布博文&lt;/h3&gt;
+
+&lt;p&gt;在你的博客的GitHub代码库页面里，点开_posts文件夹，这里面就是你的博客文章。&lt;/p&gt;
+
+&lt;p&gt;这些文章使用的格式是Markdown，文件后缀名是md，这是一种非常简单易用的有格式文本标记语言，你应该已经注意到，在LOFFER自带的示例性博文中有一篇中文的Markdown语法介绍。&lt;/p&gt;
+
+&lt;p&gt;更简单的办法是使用&lt;a href=&quot;https://typora.io/&quot;&gt;Typora&lt;/a&gt;，这是一个全图形化界面，全实时预览的Markdown写作软件，非常轻量，而且免费。&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;https://raw.githubusercontent.com/FromEndWorld/LOFFER/master/images/Typora.png&quot; alt=&quot;img&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;在发布博文前，你需要在文章的头部添加这样的内容，包括你的文章标题，发布日期，作者名，和tag等。&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;---
+layout: post
+title: LOFFER文档
+date: 2019-06-02
+Author: 来自中世界
+categories: 
+tags: [sample, document]
+comments: true
+--- 
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;完成后，保存为.md文件，文件名是date-标题，例如 2019-06-02-document.md (注意这里的标题会成为这个post的URL，所以推荐使用字母而非中文，它不影响页面上显示的标题)。然后上传到_posts文件夹，commit，很快就可以在博客上看到新文章了。&lt;/p&gt;
+
+&lt;h3 id=&quot;可选图片怎么办&quot;&gt;可选：图片怎么办？&lt;/h3&gt;
+
+&lt;p&gt;少量图片可以上传到images文件夹，然后在博文中添加。&lt;/p&gt;
+
+&lt;p&gt;但是GitHub用来当做图床有滥用之嫌，如果你的博客以图片为主，建议选择外链图床，例如&lt;a href=&quot;https://sm.ms/&quot;&gt;sm.ms&lt;/a&gt;就是和很好的选择。&lt;/p&gt;
+
+&lt;p&gt;如果想要寻找更适合自己的图床，敬请Google一下。&lt;/p&gt;
+
+&lt;p&gt;在博文中添加图片的Markdown语法是：&lt;code class=&quot;highlighter-rouge&quot;&gt;![图片名](URL)&lt;/code&gt;&lt;/p&gt;
+
+&lt;h3 id=&quot;可选添加评论区&quot;&gt;可选：添加评论区&lt;/h3&gt;
+
+&lt;p&gt;LOFFER支持Disqus评论，虽然Disqus很丑，但是它是免费的，设置起来又方便，因此大家也就不要嫌弃它。&lt;/p&gt;
+
+&lt;p&gt;首先，注册一个&lt;a href=&quot;https://disqus.com/&quot;&gt;Disqus&lt;/a&gt;账户，我们可以选择这个免费方案：&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;https://raw.githubusercontent.com/FromEndWorld/LOFFER/master/images/Disqus-plan.png&quot; alt=&quot;img&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;注册成功后，新建一个站点（site），以LOFFER为例设置步骤如下：&lt;/p&gt;
+
+&lt;p&gt;首先站点名LOFFER，生成了shortname是loffer，类型可以随便选。&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;https://raw.githubusercontent.com/FromEndWorld/LOFFER/master/images/Disqus-1.png&quot; alt=&quot;img&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;安装时选择Jekyll。&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;https://raw.githubusercontent.com/FromEndWorld/LOFFER/master/images/Disqus-2.png&quot; alt=&quot;img&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;最后填入你的博客地址，语言可以选中文，点Complete，即可！&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;https://raw.githubusercontent.com/FromEndWorld/LOFFER/master/images/Disqus-3.png&quot; alt=&quot;img&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;然后需要回到你的博客，修改_config.yml文件，在disqus字段填上你的shortname，commit，完成！&lt;/p&gt;
+
+&lt;h3 id=&quot;导入lofter的内容&quot;&gt;导入LOFTER的内容&lt;/h3&gt;
+
+&lt;p&gt;这部分由于LOFTER的导出文件十分&lt;del&gt;优秀&lt;/del&gt;，需要另外解决。&lt;/p&gt;
+
+&lt;p&gt;诸位可以使用&lt;a href=&quot;http://underdream.lofter.com/post/38ea7d_1c5d8a983&quot;&gt;墨问非名太太的脚本&lt;/a&gt;，其中选择Jekyll输出即可。&lt;/p&gt;
+
+&lt;p&gt;我个人也在折腾一个脚本，目前还没有完全debug清楚，不管如何，请先在lofter里导出一下，存在本地也是好的，贴吧可以让2017以前所有内容全部消失，中国互联网，没什么不可能发生的。&lt;/p&gt;
+
+&lt;h2 id=&quot;致谢&quot;&gt;致谢&lt;/h2&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;&lt;a href=&quot;https://github.com/jekyll/jekyll&quot;&gt;Jekyll&lt;/a&gt; - 这是本站存在的根基&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://github.com/aweekj/kiko-now&quot;&gt;Kiko-now&lt;/a&gt; - 我首先是fork这个主题，然后再其上进行修改汉化，才有了LOFFER&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://fontawesome.com/&quot;&gt;Font Awesome&lt;/a&gt; - 社交网络图标来自FontAwesome的免费开源内容&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;h2 id=&quot;帮助这个项目&quot;&gt;帮助这个项目&lt;/h2&gt;
+
+&lt;p&gt;介绍更多人来使用它，摆脱lofter自由飞翔！&lt;/p&gt;
+
+&lt;p&gt;当然如果单说写同人的话，我还是建议大家都去AO3，但是自家博客自己架也很酷炫，你还可以选择很多其他的forkable Jeykll主题，GitHub上有很多，或者试试其他博客架设工具，例如Hexo，与代码斗其乐无穷。&lt;/p&gt;
+
+&lt;p&gt;最后，回到&lt;a href=&quot;https://github.com/FromEndWorld/LOFFER&quot;&gt;LOFFER&lt;/a&gt;，给我点一个☆吧！&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;https://raw.githubusercontent.com/FromEndWorld/LOFFER/master/images/givemefive.png&quot; alt=&quot;img&quot; /&gt;&lt;/p&gt;
+</description>
+        <pubDate>Sun, 02 Jun 2019 00:00:00 +0800</pubDate>
+        <link>/document/</link>
+        <guid isPermaLink="true">/document/</guid>
+        
+        <category>sample</category>
+        
+        <category>document</category>
+        
+        
+      </item>
+    
+      <item>
+        <title>Markdown语法简介</title>
+        <description>&lt;p&gt;本中文版Markdown语法简介来自博客 &lt;a href=&quot;https://blog.shengbin.me/posts/markdown-syntax&quot;&gt;https://blog.shengbin.me/posts/markdown-syntax&lt;/a&gt;&lt;/p&gt;
+
+&lt;p&gt;Markdown语法的完整介绍在这里：&lt;a href=&quot;http://daringfireball.net/projects/markdown/syntax&quot;&gt;http://daringfireball.net/projects/markdown/syntax&lt;/a&gt;。下面整理的这些为了方便写博客时参考。&lt;/p&gt;
+
+&lt;h3 id=&quot;分段与分行&quot;&gt;分段与分行&lt;/h3&gt;
+
+&lt;p&gt;以一个或多个空行来隔开段落；以两个或多个空格来段内换行。&lt;/p&gt;
+
+&lt;h3 id=&quot;标题&quot;&gt;标题&lt;/h3&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;This is an H1
+=============
+
+This is an H2
+-------------
+
+# This is an H1
+
+##  This is an H2
+
+######  This is an H6
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;h3 id=&quot;引用&quot;&gt;引用&lt;/h3&gt;
+
+&lt;p&gt;在每一行前面写一个&lt;code class=&quot;highlighter-rouge&quot;&gt;&amp;gt;&lt;/code&gt;：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&amp;gt; This is a blockquote with two paragraphs. Lorem ipsum dolor sit amet,
+&amp;gt; consectetuer adipiscing elit. Aliquam hendrerit mi posuere lectus.
+&amp;gt; Vestibulum enim wisi, viverra nec, fringilla in, laoreet vitae, risus.
+&amp;gt;
+&amp;gt; Donec sit amet nisl. Aliquam semper ipsum sit amet velit. Suspendisse
+&amp;gt; id sem consectetuer libero luctus adipiscing.
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;效果：&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;This is a blockquote with two paragraphs. Lorem ipsum dolor sit amet, consectetuer adipiscing elit. Aliquam hendrerit mi posuere lectus. Vestibulum enim wisi, viverra nec, fringilla in, laoreet vitae, risus.&lt;/p&gt;
+
+  &lt;p&gt;Donec sit amet nisl. Aliquam semper ipsum sit amet velit. Suspendisse id sem consectetuer libero luctus adipiscing.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;或者在每一段前面写一个&lt;code class=&quot;highlighter-rouge&quot;&gt;&amp;gt;&lt;/code&gt;：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&amp;gt; This is a blockquote with two paragraphs. Lorem ipsum dolor sit amet,
+consectetuer adipiscing elit. Aliquam hendrerit mi posuere lectus.
+Vestibulum enim wisi, viverra nec, fringilla in, laoreet vitae, risus.
+
+&amp;gt; Donec sit amet nisl. Aliquam semper ipsum sit amet velit. Suspendisse
+id sem consectetuer libero luctus adipiscing.
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;h3 id=&quot;多重引用&quot;&gt;多重引用&lt;/h3&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&amp;gt; This is the first level of quoting.
+&amp;gt;
+&amp;gt; &amp;gt; This is nested blockquote.
+&amp;gt;
+&amp;gt; Back to the first level.
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;效果：&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;This is the first level of quoting.&lt;/p&gt;
+
+  &lt;blockquote&gt;
+    &lt;p&gt;This is nested blockquote.&lt;/p&gt;
+  &lt;/blockquote&gt;
+
+  &lt;p&gt;Back to the first level.&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;h3 id=&quot;列表&quot;&gt;列表&lt;/h3&gt;
+
+&lt;p&gt;列表项占一行，以*、+、-开头即可：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;*   Red
+*   Green
+*   Blue
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;效果：&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;Red&lt;/li&gt;
+  &lt;li&gt;Green&lt;/li&gt;
+  &lt;li&gt;Blue&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;有序列表只需要将上述标记符换成数字加句点。而且顺序由书写顺序决定，与数字无关，但数字需要从1开始。例如：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;1\.  Bird
+3.  McHale
+2.  Parish
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;效果：&lt;/p&gt;
+
+&lt;ol&gt;
+  &lt;li&gt;Bird&lt;/li&gt;
+  &lt;li&gt;McHale&lt;/li&gt;
+  &lt;li&gt;Parish&lt;/li&gt;
+&lt;/ol&gt;
+
+&lt;p&gt;每一个列表项可以多行：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;*   Lorem ipsum dolor sit amet, consectetuer adipiscing elit.
+Aliquam hendrerit mi posuere lectus. Vestibulum enim wisi,
+viverra nec, fringilla in, laoreet vitae, risus.
+*   Donec sit amet nisl. Aliquam semper ipsum sit amet velit.
+Suspendisse id sem consectetuer libero luctus adipiscing.
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;效果：&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;Lorem ipsum dolor sit amet, consectetuer adipiscing elit. Aliquam hendrerit mi posuere lectus. Vestibulum enim wisi, viverra nec, fringilla in, laoreet vitae, risus.&lt;/li&gt;
+  &lt;li&gt;Donec sit amet nisl. Aliquam semper ipsum sit amet velit. Suspendisse id sem consectetuer libero luctus adipiscing.&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;h3 id=&quot;代码块&quot;&gt;代码块&lt;/h3&gt;
+
+&lt;p&gt;每一行前面缩进四个或以上个空格，就认为是开始了一段代码块。代码块内原样输出。&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;This is a normal paragraph:
+
+    This is a code block.
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;效果：&lt;/p&gt;
+
+&lt;p&gt;This is a normal paragraph:&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;This is a code block.
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;h3 id=&quot;横线&quot;&gt;横线&lt;/h3&gt;
+
+&lt;p&gt;三个或更多个&lt;code class=&quot;highlighter-rouge&quot;&gt;*&lt;/code&gt;、&lt;code class=&quot;highlighter-rouge&quot;&gt;-&lt;/code&gt;（它们之间可以有空格）会产生横线：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;* * *
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;效果：&lt;/p&gt;
+
+&lt;hr /&gt;
+
+&lt;h3 id=&quot;链接&quot;&gt;链接&lt;/h3&gt;
+
+&lt;p&gt;内嵌链接：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;I get 10 times more traffic from [Google](http://google.com/ &quot;Google&quot;)
+than from [Yahoo](http://search.yahoo.com/ &quot;Yahoo Search&quot;) or
+[MSN](http://search.msn.com/ &quot;MSN Search&quot;).
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;或参考文献式链接（缺省的链接标记认为与文本一致）：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;I get 10 times more traffic from [Google] [1] than from
+[Yahoo] [2] or [MSN] [3].
+
+  [1]: http://google.com/        &quot;Google&quot;
+  [2]: http://search.yahoo.com/  &quot;Yahoo Search&quot;
+  [3]: http://search.msn.com/    &quot;MSN Search&quot;
+
+I get 10 times more traffic from [Google][] than from
+[Yahoo][] or [MSN][].
+
+  [google]: http://google.com/        &quot;Google&quot;
+  [yahoo]:  http://search.yahoo.com/  &quot;Yahoo Search&quot;
+  [msn]:    http://search.msn.com/    &quot;MSN Search&quot;
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;效果：&lt;/p&gt;
+
+&lt;p&gt;I get 10 times more traffic from &lt;a href=&quot;http://google.com/&quot; title=&quot;Google&quot;&gt;Google&lt;/a&gt; than from &lt;a href=&quot;http://search.yahoo.com/&quot; title=&quot;Yahoo Search&quot;&gt;Yahoo&lt;/a&gt; or &lt;a href=&quot;http://search.msn.com/&quot; title=&quot;MSN Search&quot;&gt;MSN&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;如果直接以链接地址作为链接文本，可以用如下快捷写法：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&amp;lt;http://www.shengbin.me&amp;gt; 效果：
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;&lt;a href=&quot;http://www.shengbin.me/&quot;&gt;http://www.shengbin.me&lt;/a&gt;&lt;/p&gt;
+
+&lt;h3 id=&quot;强调&quot;&gt;强调&lt;/h3&gt;
+
+&lt;p&gt;单个&lt;code class=&quot;highlighter-rouge&quot;&gt;*&lt;/code&gt;或&lt;code class=&quot;highlighter-rouge&quot;&gt;_&lt;/code&gt;产生斜体，两个（&lt;code class=&quot;highlighter-rouge&quot;&gt;**&lt;/code&gt;、&lt;code class=&quot;highlighter-rouge&quot;&gt;__&lt;/code&gt;）则产生粗体。例如：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;*like* _this_
+
+**like** **this**
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;效果：&lt;/p&gt;
+
+&lt;p&gt;&lt;em&gt;like&lt;/em&gt; &lt;em&gt;this&lt;/em&gt;&lt;/p&gt;
+
+&lt;p&gt;&lt;strong&gt;like&lt;/strong&gt; &lt;strong&gt;this&lt;/strong&gt;&lt;/p&gt;
+
+&lt;h3 id=&quot;内嵌代码&quot;&gt;内嵌代码&lt;/h3&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;code: `echo hello`
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;效果：&lt;/p&gt;
+
+&lt;p&gt;code: &lt;code class=&quot;highlighter-rouge&quot;&gt;echo hello&lt;/code&gt;&lt;/p&gt;
+
+&lt;h3 id=&quot;图片&quot;&gt;图片&lt;/h3&gt;
+
+&lt;p&gt;图片与链接类似，只需在文本前面加上感叹号&lt;code class=&quot;highlighter-rouge&quot;&gt;!&lt;/code&gt;即可。图片位置和大小无法通过Markdown来指定。&lt;/p&gt;
+
+&lt;h3 id=&quot;转义字符&quot;&gt;转义字符&lt;/h3&gt;
+
+&lt;p&gt;以下特殊字符需要用&lt;code class=&quot;highlighter-rouge&quot;&gt;\&lt;/code&gt;转义得到。&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;\   backslash
+`   backtick
+*   asterisk
+_   underscore
+{}  curly braces
+[]  square brackets
+()  parentheses
+#   hash mark
++   plus sign
+-   minus sign (hyphen)
+.   dot
+!   exclamation mark
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+</description>
+        <pubDate>Tue, 16 Jul 2013 00:00:00 +0800</pubDate>
+        <link>/chinese-markdown-cheatsheet/</link>
+        <guid isPermaLink="true">/chinese-markdown-cheatsheet/</guid>
+        
+        <category>sample</category>
+        
+        <category>markdown</category>
+        
+        
+      </item>
+    
+  </channel>
+</rss>

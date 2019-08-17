@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html>
+  <head>
+  <title>分析Linux系统调用 – Sevico的博客 – </title>
+
+      <meta charset="utf-8" />
+    <meta content='text/html; charset=utf-8' http-equiv='Content-Type'>
+    <meta http-equiv='X-UA-Compatible' content='IE=edge'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+
+    
+    <meta name="description" content="在不同类型的操作系统上，系统调用都是内核给用户态的应用程序提供操作原语最主要的方式。虽然Linux内核在此基础上还有其他的途径来给用户程序提供一些接口(例如proc文件系统，netlink)，但也或多或少地依赖了系统调用。所以对Linux系统调用的实现进行分析，打开这个黑盒子，能进一步了解其底层实现，进而将一些操作系统概念与真实世界的实作联系起来，甚至能发现许多手册上没有提到，或者表述不清的地方(毕竟手册上的东西更多表述的是抽象接口)！况且，这件事本身也非常有意思！
+
+首先，你不能分析一个你看不见的东西。而在Linux内核的较高版本上，已经将通过宏定义的方式来声明系统调用。
+老版本(2.6.24)如下：
+
+asmlinkage unsigned long sys_alarm(unsigned int seconds)
+{
+	return alarm_setitimer(seconds);
+}
+
+
+而在较高(4.4)版本的源码中，已变为:
+
+SYSCALL_DEFINE1(alarm, unsigned int, seconds)
+{
+	return alarm_setitimer(seconds);
+}
+
+这样的形式。
+
+其中的SYSCALL_DEFINE1是用于生成只有一个参数的系统调用声明，该宏展开后所对应的代码形式类似于老版本的样子。
+
+虽然这样做在软件工程的角度讲可以将系统调用的声明方式归拢到一处(宏定义处)，但这阻碍了很多代码分析工具(source insight,visual studio code)对系统调用的正常识别：会将系统调用当成一个宏的参数，而不是一个函数。这样会影响我们对系统调用实现函数的定位。
+
+我目前对该问题的解决方案是，利用这些系统调用声明宏都是以SYSCALL_DEFINE开头的特点，通过文本编辑器(如sublime text)或者grep来在Linux内核项目中找到所有SYSCALL_DEFINE出现的地方，就可以定位到所有系统调用声明处了(虽然会有些不是地方，例如文档中，但极少)。如果你有更好的方法，欢迎留言探讨。
+
+例如用grep来完成的命令是：grep -rn SYSCALL_DEFINE ./
+执行部分结果大致如下：
+./kernel/time/itimer.c:103:SYSCALL_DEFINE2(getitimer, int, which, struct itimerval __user *, value)
+./kernel/time/itimer.c:278:SYSCALL_DEFINE3(setitimer, int, which, struct itimerval __user *, value,
+./kernel/time/posix-timers.c:607:SYSCALL_DEFINE3(timer_create, const clockid_t, which_clock,
+./kernel/time/posix-timers.c:781:SYSCALL_DEFINE2(timer_gettime, timer_t, timer_id,
+./kernel/time/posix-timers.c:817:SYSCALL_DEFINE1(timer_getoverrun, timer_t, timer_id)
+./kernel/time/posix-timers.c:885:SYSCALL_DEFINE4(timer_settime, timer_t, timer_id, int, flags,
+./kernel/time/posix-timers.c:948:SYSCALL_DEFINE1(timer_delete, timer_t, timer_id)
+...
+
+
+
+从其中可以看到getitimer(kernel/time/itimer.c文件中的103行)等系统调用的定义位置。注：我的代码因为加了我自己的一些注释，可能会和你搜索的结果不同。
+
+我把这个命令的输出重定向到文件中，方便查阅系统调用的定义位置。算是对代码分析工具的一个补充吧。
+
+至于用来实现这些系统调用的实现函数，则大多可以通过代码分析工具定位到，方便进行进一步分析。
+
+有了这个命令的执行结果，加上一个趁手的代码阅读工具，就可以继续进行系统调用的分析了。
+
+在本系列文章中，将会聚焦于系统调用的具体实现，站在内核的角度进行描述，假定用户程序已经通过某种机制将系统调用要用到的参数传递到内核中。暂时不会讲述与系统调用实现相关的体系结构相关的知识，例如如何传递调用参数，如何进行特权级切换等。虽然这些内容同样非常重要，但十分依赖具体的硬件架构，而且网上也有很多不错的相关资料。后面如有需要，会加以补充x86-64平台上的实现方式。
+
+在接下来的文章中，我会具体从易到难地讲述每个系统调用的实现方式。对涉及更下层次的具体实现(例如VFS方面)，本系列文章会暂时浅尝辄止,不会深入进去。而会另开一些列文章进行叙述。保证这一些列文章都在一个大致相似的实现层次。
+
+在本系列文章的写作中，势必会引用很多书籍，网上的资料。在此先提前感谢！
+
+如有任何疑问，欢迎留言反馈。也可以给我发email:2927098@qq.com
+" />
+    <meta property="og:description" content="在不同类型的操作系统上，系统调用都是内核给用户态的应用程序提供操作原语最主要的方式。虽然Linux内核在此基础上还有其他的途径来给用户程序提供一些接口(例如proc文件系统，netlink)，但也或多或少地依赖了系统调用。所以对Linux系统调用的实现进行分析，打开这个黑盒子，能进一步了解其底层实现，进而将一些操作系统概念与真实世界的实作联系起来，甚至能发现许多手册上没有提到，或者表述不清的地方(毕竟手册上的东西更多表述的是抽象接口)！况且，这件事本身也非常有意思！
+
+首先，你不能分析一个你看不见的东西。而在Linux内核的较高版本上，已经将通过宏定义的方式来声明系统调用。
+老版本(2.6.24)如下：
+
+asmlinkage unsigned long sys_alarm(unsigned int seconds)
+{
+	return alarm_setitimer(seconds);
+}
+
+
+而在较高(4.4)版本的源码中，已变为:
+
+SYSCALL_DEFINE1(alarm, unsigned int, seconds)
+{
+	return alarm_setitimer(seconds);
+}
+
+这样的形式。
+
+其中的SYSCALL_DEFINE1是用于生成只有一个参数的系统调用声明，该宏展开后所对应的代码形式类似于老版本的样子。
+
+虽然这样做在软件工程的角度讲可以将系统调用的声明方式归拢到一处(宏定义处)，但这阻碍了很多代码分析工具(source insight,visual studio code)对系统调用的正常识别：会将系统调用当成一个宏的参数，而不是一个函数。这样会影响我们对系统调用实现函数的定位。
+
+我目前对该问题的解决方案是，利用这些系统调用声明宏都是以SYSCALL_DEFINE开头的特点，通过文本编辑器(如sublime text)或者grep来在Linux内核项目中找到所有SYSCALL_DEFINE出现的地方，就可以定位到所有系统调用声明处了(虽然会有些不是地方，例如文档中，但极少)。如果你有更好的方法，欢迎留言探讨。
+
+例如用grep来完成的命令是：grep -rn SYSCALL_DEFINE ./
+执行部分结果大致如下：
+./kernel/time/itimer.c:103:SYSCALL_DEFINE2(getitimer, int, which, struct itimerval __user *, value)
+./kernel/time/itimer.c:278:SYSCALL_DEFINE3(setitimer, int, which, struct itimerval __user *, value,
+./kernel/time/posix-timers.c:607:SYSCALL_DEFINE3(timer_create, const clockid_t, which_clock,
+./kernel/time/posix-timers.c:781:SYSCALL_DEFINE2(timer_gettime, timer_t, timer_id,
+./kernel/time/posix-timers.c:817:SYSCALL_DEFINE1(timer_getoverrun, timer_t, timer_id)
+./kernel/time/posix-timers.c:885:SYSCALL_DEFINE4(timer_settime, timer_t, timer_id, int, flags,
+./kernel/time/posix-timers.c:948:SYSCALL_DEFINE1(timer_delete, timer_t, timer_id)
+...
+
+
+
+从其中可以看到getitimer(kernel/time/itimer.c文件中的103行)等系统调用的定义位置。注：我的代码因为加了我自己的一些注释，可能会和你搜索的结果不同。
+
+我把这个命令的输出重定向到文件中，方便查阅系统调用的定义位置。算是对代码分析工具的一个补充吧。
+
+至于用来实现这些系统调用的实现函数，则大多可以通过代码分析工具定位到，方便进行进一步分析。
+
+有了这个命令的执行结果，加上一个趁手的代码阅读工具，就可以继续进行系统调用的分析了。
+
+在本系列文章中，将会聚焦于系统调用的具体实现，站在内核的角度进行描述，假定用户程序已经通过某种机制将系统调用要用到的参数传递到内核中。暂时不会讲述与系统调用实现相关的体系结构相关的知识，例如如何传递调用参数，如何进行特权级切换等。虽然这些内容同样非常重要，但十分依赖具体的硬件架构，而且网上也有很多不错的相关资料。后面如有需要，会加以补充x86-64平台上的实现方式。
+
+在接下来的文章中，我会具体从易到难地讲述每个系统调用的实现方式。对涉及更下层次的具体实现(例如VFS方面)，本系列文章会暂时浅尝辄止,不会深入进去。而会另开一些列文章进行叙述。保证这一些列文章都在一个大致相似的实现层次。
+
+在本系列文章的写作中，势必会引用很多书籍，网上的资料。在此先提前感谢！
+
+如有任何疑问，欢迎留言反馈。也可以给我发email:2927098@qq.com
+" />
+    
+    <meta name="author" content="Sevico的博客" />
+
+    
+    <meta property="og:title" content="分析Linux系统调用" />
+    <meta property="twitter:title" content="分析Linux系统调用" />
+    
+  <!-- Async font loading -->
+<script>
+  window.WebFontConfig = {
+      custom: {
+          families: ['Spoqa Han Sans:100,300,400,700'],
+          urls: ['https://spoqa.github.io/spoqa-han-sans/css/SpoqaHanSans-kr.css']
+      },
+      timeout: 60000
+  };
+  (function(d) {
+      var wf = d.createElement('script'), s = d.scripts[0];
+      wf.src = 'https://ajax.googleapis.com/ajax/libs/webfont/1.5.18/webfont.js';
+      s.parentNode.insertBefore(wf, s);
+  })(document);
+</script>
+
+  <!--[if lt IE 9]>
+    <script src="http://html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+  <![endif]-->
+
+  <link rel="stylesheet" type="text/css" href="/style.css" />
+  <link rel="alternate" type="application/rss+xml" title="Sevico的博客 - " href="/feed.xml" />
+  <link rel="shortcut icon" href="https://raw.githubusercontent.com/FromEndWorld/LOFFER/master/images/favicon.png">
+  <script src="https://kit.fontawesome.com/56f7faf3f4.js"></script>
+
+
+  <!-- Created with Jekyll Now - http://github.com/barryclark/jekyll-now -->
+
+</head>
+  <body>
+    <div class="wrapper-sidebar">
+  <header class="sidebar clearfix">
+    <div class="site-info">
+      
+        <a href="/" class="site-avatar"><img src="https://raw.githubusercontent.com/FromEndWorld/LOFFER/master/images/logo.png" /></a>
+       
+      <h1 class="site-name"><a href="/">Sevico的博客</a></h1>
+      <p class="site-description"></p>
+    </div>
+  </header>
+
+  <div class="navlist">
+    <nav>
+      
+      
+      <a href="/">首页</a>
+      
+      
+      
+      <a href="/about">关于</a>
+      
+      
+      
+      <a href="/archive">归档</a>
+      
+      
+      
+      <a href="/tags">标签</a>
+      
+      
+    </nav>
+  </div>
+
+  <div class="wrapper-footer-desktop">
+    <footer class="footer">
+      <!-- Refer to https://codepen.io/ruandre/pen/howFi -->
+<ul class="svg-icon">
+
+  
+  
+  
+
+  
+
+  
+  <li><a href="mailto:fromendworld@outlook.com" class="icon-8 email" title="Email"><svg viewBox="0 0 512 512"><path d="M502.3 190.8c3.9-3.1 9.7-.2 9.7 4.7V400c0 26.5-21.5 48-48 48H48c-26.5 0-48-21.5-48-48V195.6c0-5 5.7-7.8 9.7-4.7 22.4 17.4 52.1 39.5 154.1 113.6 21.1 15.4 56.7 47.8 92.2 47.6 35.7.3 72-32.8 92.3-47.6 102-74.1 131.6-96.3 154-113.7zM256 320c23.2.4 56.6-29.2 73.4-41.4 132.7-96.3 142.8-104.7 173.4-128.7 5.8-4.5 9.2-11.5 9.2-18.9v-19c0-26.5-21.5-48-48-48H48C21.5 64 0 85.5 0 112v19c0 7.4 3.4 14.3 9.2 18.9 30.6 23.9 40.7 32.4 173.4 128.7 16.8 12.2 50.2 41.8 73.4 41.4z"/></svg><!--[if lt IE 9]><em>Email</em><![endif]--></a></li>
+  
+
+  
+
+  
+
+  
+  <li><a href="https://github.com/FromEndWorld/loffer" class="icon-13 github" title="GitHub"><svg viewBox="0 0 512 512"><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg><!--[if lt IE 9]><em>GitHub</em><![endif]--></a></li>
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+</ul>
+
+
+
+<p>Copyright (c) 2019 来自中世界</p>
+
+    </footer>
+  </div>
+</div>
+
+    <div id="main" role="main" class="wrapper-content">
+      <article class="posts">
+  <h1>分析Linux系统调用</h1>
+
+  <div clsss="meta">
+    <span class="date">
+      2019-08-17
+    </span>
+
+    <ul class="tag">
+      
+    </ul>
+  </div>
+
+  <div class="entry">
+    <p>在不同类型的操作系统上，系统调用都是内核给用户态的应用程序提供操作原语最主要的方式。虽然Linux内核在此基础上还有其他的途径来给用户程序提供一些接口(例如proc文件系统，netlink)，但也或多或少地依赖了系统调用。所以对Linux系统调用的实现进行分析，打开这个黑盒子，能进一步了解其底层实现，进而将一些操作系统概念与真实世界的实作联系起来，甚至能发现许多手册上没有提到，或者表述不清的地方(毕竟手册上的东西更多表述的是抽象接口)！况且，这件事本身也非常有意思！</p>
+
+<p>首先，你不能分析一个你看不见的东西。而在Linux内核的较高版本上，已经将通过宏定义的方式来声明系统调用。
+老版本(2.6.24)如下：</p>
+
+<div class="highlighter-rouge"><div class="highlight"><pre class="highlight"><code>asmlinkage unsigned long sys_alarm(unsigned int seconds)
+{
+	return alarm_setitimer(seconds);
+}
+</code></pre></div></div>
+
+<p>而在较高(4.4)版本的源码中，已变为:</p>
+
+<div class="highlighter-rouge"><div class="highlight"><pre class="highlight"><code>SYSCALL_DEFINE1(alarm, unsigned int, seconds)
+{
+	return alarm_setitimer(seconds);
+}
+</code></pre></div></div>
+<p>这样的形式。</p>
+
+<p>其中的SYSCALL_DEFINE1是用于生成只有一个参数的系统调用声明，该宏展开后所对应的代码形式类似于老版本的样子。</p>
+
+<p>虽然这样做在软件工程的角度讲可以将系统调用的声明方式归拢到一处(宏定义处)，但这阻碍了很多代码分析工具(source insight,visual studio code)对系统调用的正常识别：会将系统调用当成一个宏的参数，而不是一个函数。这样会影响我们对系统调用实现函数的定位。</p>
+
+<p>我目前对该问题的解决方案是，利用这些系统调用声明宏都是以<code class="highlighter-rouge">SYSCALL_DEFINE</code>开头的特点，通过文本编辑器(如sublime text)或者grep来在Linux内核项目中找到所有<code class="highlighter-rouge">SYSCALL_DEFINE</code>出现的地方，就可以定位到所有系统调用声明处了(虽然会有些不是地方，例如文档中，但极少)。如果你有更好的方法，欢迎留言探讨。</p>
+
+<p>例如用grep来完成的命令是：<code class="highlighter-rouge">grep -rn SYSCALL_DEFINE ./</code>
+执行部分结果大致如下：</p>
+<div class="highlighter-rouge"><div class="highlight"><pre class="highlight"><code>./kernel/time/itimer.c:103:SYSCALL_DEFINE2(getitimer, int, which, struct itimerval __user *, value)
+./kernel/time/itimer.c:278:SYSCALL_DEFINE3(setitimer, int, which, struct itimerval __user *, value,
+./kernel/time/posix-timers.c:607:SYSCALL_DEFINE3(timer_create, const clockid_t, which_clock,
+./kernel/time/posix-timers.c:781:SYSCALL_DEFINE2(timer_gettime, timer_t, timer_id,
+./kernel/time/posix-timers.c:817:SYSCALL_DEFINE1(timer_getoverrun, timer_t, timer_id)
+./kernel/time/posix-timers.c:885:SYSCALL_DEFINE4(timer_settime, timer_t, timer_id, int, flags,
+./kernel/time/posix-timers.c:948:SYSCALL_DEFINE1(timer_delete, timer_t, timer_id)
+...
+
+</code></pre></div></div>
+
+<p>从其中可以看到<code class="highlighter-rouge">getitimer</code>(kernel/time/itimer.c文件中的103行)等系统调用的定义位置。注：我的代码因为加了我自己的一些注释，可能会和你搜索的结果不同。</p>
+
+<p>我把这个命令的输出重定向到文件中，方便查阅系统调用的定义位置。算是对代码分析工具的一个补充吧。</p>
+
+<p>至于用来实现这些系统调用的实现函数，则大多可以通过代码分析工具定位到，方便进行进一步分析。</p>
+
+<p>有了这个命令的执行结果，加上一个趁手的代码阅读工具，就可以继续进行系统调用的分析了。</p>
+
+<p>在本系列文章中，将会聚焦于系统调用的具体实现，站在内核的角度进行描述，假定用户程序已经通过某种机制将系统调用要用到的参数传递到内核中。暂时不会讲述与系统调用实现相关的体系结构相关的知识，例如如何传递调用参数，如何进行特权级切换等。虽然这些内容同样非常重要，但十分依赖具体的硬件架构，而且网上也有很多不错的相关资料。后面如有需要，会加以补充x86-64平台上的实现方式。</p>
+
+<p>在接下来的文章中，我会具体从易到难地讲述每个系统调用的实现方式。对涉及更下层次的具体实现(例如VFS方面)，本系列文章会暂时<code class="highlighter-rouge">浅尝辄止</code>,不会深入进去。而会另开一些列文章进行叙述。保证这一些列文章都在一个大致相似的实现层次。</p>
+
+<p>在本系列文章的写作中，势必会引用很多书籍，网上的资料。在此先提前感谢！</p>
+
+<p>如有任何疑问，欢迎留言反馈。也可以给我发email:2927098@qq.com</p>
+
+  </div>
+
+  
+<div class="comments">
+	<div id="disqus_thread"></div>
+	<script type="text/javascript">
+
+	    var disqus_shortname = 'loffer';
+
+	    (function() {
+	        var dsq = document.createElement('script'); dsq.type = 'text/javascript'; dsq.async = true;
+	        dsq.src = '//' + disqus_shortname + '.disqus.com/embed.js';
+	        (document.getElementsByTagName('head')[0] || document.getElementsByTagName('body')[0]).appendChild(dsq);
+	    })();
+
+	</script>
+	<noscript>Please enable JavaScript to view the <a href="http://disqus.com/?ref_noscript">comments powered by Disqus.</a></noscript>
+</div>
+
+</article>
+
+<div class="pagination">
+  
+    <span class="prev" >
+      <a href="/welcome-to-jekyll/">
+        ← 上一篇
+      </a>
+    </span>
+  
+  
+</div>
+    </div>
+
+    
+
+  </body>
+
+  <div class="wrapper-footer-mobile">
+    <footer class="footer">
+      <!-- Refer to https://codepen.io/ruandre/pen/howFi -->
+<ul class="svg-icon">
+
+  
+  
+  
+
+  
+
+  
+  <li><a href="mailto:fromendworld@outlook.com" class="icon-8 email" title="Email"><svg viewBox="0 0 512 512"><path d="M502.3 190.8c3.9-3.1 9.7-.2 9.7 4.7V400c0 26.5-21.5 48-48 48H48c-26.5 0-48-21.5-48-48V195.6c0-5 5.7-7.8 9.7-4.7 22.4 17.4 52.1 39.5 154.1 113.6 21.1 15.4 56.7 47.8 92.2 47.6 35.7.3 72-32.8 92.3-47.6 102-74.1 131.6-96.3 154-113.7zM256 320c23.2.4 56.6-29.2 73.4-41.4 132.7-96.3 142.8-104.7 173.4-128.7 5.8-4.5 9.2-11.5 9.2-18.9v-19c0-26.5-21.5-48-48-48H48C21.5 64 0 85.5 0 112v19c0 7.4 3.4 14.3 9.2 18.9 30.6 23.9 40.7 32.4 173.4 128.7 16.8 12.2 50.2 41.8 73.4 41.4z"/></svg><!--[if lt IE 9]><em>Email</em><![endif]--></a></li>
+  
+
+  
+
+  
+
+  
+  <li><a href="https://github.com/FromEndWorld/loffer" class="icon-13 github" title="GitHub"><svg viewBox="0 0 512 512"><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg><!--[if lt IE 9]><em>GitHub</em><![endif]--></a></li>
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+</ul>
+
+
+
+<p>Copyright (c) 2019 来自中世界</p>
+
+    </footer>
+
+
+</html>
