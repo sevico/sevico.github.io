@@ -99,6 +99,10 @@ static inline long SYSC_alarm(unsigned int seconds);
 #define __SC_TEST(t, a) (void)BUILD_BUG_ON_ZERO(!__TYPE_IS_LL(t) && sizeof(t) > sizeof(long))
 ```
 
+```
+#define __stringify_1(x...)	#x
+#define __stringify(x...)	__stringify_1(x)
+```
 可见SYSCALL_DEFINE1是用于生成只有一个参数的系统调用声明，该宏展开后声明的函数SYSC_alarm类似于老版本内核的sys_alarm。
 
 虽然这样做在软件工程的角度讲可以将系统调用的声明方式归拢到一处(宏定义处)，并易于扩展。但这同时阻碍了很多代码分析工具(source insight,visual studio code)对系统调用的正常识别：会将系统调用当成一个宏的参数，而不是一个函数。这样会影响我们对系统调用实现函数的定位。
