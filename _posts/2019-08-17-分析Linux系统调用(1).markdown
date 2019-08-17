@@ -29,9 +29,79 @@ SYSCALL_DEFINE1(alarm, unsigned int, seconds)
 ```
 这样的形式。
 
-其中的SYSCALL_DEFINE1是用于生成只有一个参数的系统调用声明，该宏展开后所对应的代码形式类似于老版本的样子。
+其中SYSCALL_DEFINE1在include/linux/syscalls.h中的实现为
+```
+#define SYSCALL_DEFINE1(name, ...) SYSCALL_DEFINEx(1, _##name, __VA_ARGS__)
+```
+SYSCALL_DEFINEx实现为:
+```
+#define SYSCALL_DEFINEx(x, sname, ...)				\
+	SYSCALL_METADATA(sname, x, __VA_ARGS__)			\
+	__SYSCALL_DEFINEx(x, sname, __VA_ARGS__)
+```
+将x=1,sname=_alarm(注意`##name`前的下划线)带入扩展，可得：
+```
+SYSCALL_METADATA(_alarm, 1, unsigned int,seconds)
+__SYSCALL_DEFINEx(1, _alarm,  unsigned int,seconds)
+```
+其中SYSCALL_METADATA宏依据CONFIG_FTRACE_SYSCALLS的编译选项来扩展，用以支持ftrace机制。如果没有启用FRACE则扩展为一个空宏。
+继续看__SYSCALL_DEFINEx的实现：
+```
+#define __SYSCALL_DEFINEx(x, name, ...)					\
+	asmlinkage long sys##name(__MAP(x,__SC_DECL,__VA_ARGS__))	\
+		__attribute__((alias(__stringify(SyS##name))));		\
+	static inline long SYSC##name(__MAP(x,__SC_DECL,__VA_ARGS__));	\
+	asmlinkage long SyS##name(__MAP(x,__SC_LONG,__VA_ARGS__));	\
+	asmlinkage long SyS##name(__MAP(x,__SC_LONG,__VA_ARGS__))	\
+	{								\
+		long ret = SYSC##name(__MAP(x,__SC_CAST,__VA_ARGS__));	\
+		__MAP(x,__SC_TEST,__VA_ARGS__);				\
+		__PROTECT(x, ret,__MAP(x,__SC_ARGS,__VA_ARGS__));	\
+		return ret;						\
+	}								\
+	static inline long SYSC##name(__MAP(x,__SC_DECL,__VA_ARGS__))
+```
 
-虽然这样做在软件工程的角度讲可以将系统调用的声明方式归拢到一处(宏定义处)，但这阻碍了很多代码分析工具(source insight,visual studio code)对系统调用的正常识别：会将系统调用当成一个宏的参数，而不是一个函数。这样会影响我们对系统调用实现函数的定位。
+按传入参数扩展可得：
+```
+asmlinkage long sys_alarm(unsigned int seconds)
+    __attribute__((alias(__stringify(SyS_alarm))));
+static inline long SYSC_alarm(unsigned int seconds);
+
+asmlinkage long SyS_alarm(long seconds);
+asmlinkage long SyS_alarm(long seconds)
+{
+  long ret = SYSC_alarm((unsigned int)seconds);
+  BUILD_BUG_ON_ZERO(sizeof(unsigned int) > sizeof(long));
+   __PROTECT(1, ret, seconds);
+   return ret;	
+}
+static inline long SYSC_alarm(unsigned int seconds);
+
+```
+其中__MAP用于生成形参列表，__stringify就是 把  x 直接转换为字符串。其返回值就是字符串，而不是变量名。
+```
+#define __MAP0(m,...)
+#define __MAP1(m,t,a) m(t,a)
+#define __MAP2(m,t,a,...) m(t,a), __MAP1(m,__VA_ARGS__)
+#define __MAP3(m,t,a,...) m(t,a), __MAP2(m,__VA_ARGS__)
+#define __MAP4(m,t,a,...) m(t,a), __MAP3(m,__VA_ARGS__)
+#define __MAP5(m,t,a,...) m(t,a), __MAP4(m,__VA_ARGS__)
+#define __MAP6(m,t,a,...) m(t,a), __MAP5(m,__VA_ARGS__)
+#define __MAP(n,...) __MAP##n(__VA_ARGS__)
+```
+
+```
+#define __SC_DECL(t, a) t a
+#define __SC_LONG(t, a) __typeof(__builtin_choose_expr(__TYPE_IS_LL(t), 0LL, 0L)) a
+#define __SC_CAST(t, a) (t) a
+#define __SC_ARGS(t, a) a
+#define __SC_TEST(t, a) (void)BUILD_BUG_ON_ZERO(!__TYPE_IS_LL(t) && sizeof(t) > sizeof(long))
+```
+
+可见SYSCALL_DEFINE1是用于生成只有一个参数的系统调用声明，该宏展开后声明的函数SYSC_alarm类似于老版本内核的sys_alarm。
+
+虽然这样做在软件工程的角度讲可以将系统调用的声明方式归拢到一处(宏定义处)，并易于扩展。但这同时阻碍了很多代码分析工具(source insight,visual studio code)对系统调用的正常识别：会将系统调用当成一个宏的参数，而不是一个函数。这样会影响我们对系统调用实现函数的定位。
 
 我目前对该问题的解决方案是，利用这些系统调用声明宏都是以`SYSCALL_DEFINE`开头的特点，通过文本编辑器(如sublime text)或者grep来在Linux内核项目中找到所有`SYSCALL_DEFINE`出现的地方，就可以定位到所有系统调用声明处了(虽然会有些不是地方，例如文档中，但极少)。如果你有更好的方法，欢迎留言探讨。
 
