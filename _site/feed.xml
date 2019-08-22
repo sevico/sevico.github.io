@@ -2,16 +2,129 @@
 <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
   <channel>
     <title></title>
-    <description></description>
+    <description>写一些学习心得</description>
     <link>/</link>
     <atom:link href="/feed.xml" rel="self" type="application/rss+xml"/>
-    <pubDate>Sat, 17 Aug 2019 18:46:29 +0800</pubDate>
-    <lastBuildDate>Sat, 17 Aug 2019 18:46:29 +0800</lastBuildDate>
+    <pubDate>Thu, 22 Aug 2019 19:56:19 +0800</pubDate>
+    <lastBuildDate>Thu, 22 Aug 2019 19:56:19 +0800</lastBuildDate>
     <generator>Jekyll v3.1.6</generator>
     
       <item>
-        <title>分析Linux系统调用</title>
-        <description>&lt;p&gt;在不同类型的操作系统上，系统调用都是内核给用户态的应用程序提供操作原语最主要的方式。虽然Linux内核在此基础上还有其他的途径来给用户程序提供一些接口(例如proc文件系统，netlink)，但也或多或少地依赖了系统调用。所以对Linux系统调用的实现进行分析，打开这个黑盒子，能进一步了解其底层实现，进而将一些操作系统概念与真实世界的实作联系起来，甚至能发现许多手册上没有提到，或者表述不清的地方(毕竟手册上的东西更多表述的是抽象接口)！况且，这件事本身也非常有意思！&lt;/p&gt;
+        <title>pt_prev是做什么用的？</title>
+        <description>&lt;p&gt;最近通过查资料，搞明白了一个困扰我很久的问题。整理到这里。&lt;/p&gt;
+
+&lt;p&gt;在阅读Linux内核网络收报部分的源码时，一个绕不过的函数便是netif_receive_skb。它将网卡收报的报文上交给上层协议。它的具体原理这里不深究，只是其中说明一个如下的代码片段：&lt;/p&gt;
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;list_for_each_entry_rcu(ptype, &amp;amp;ptype_base[ntohs(type)&amp;amp;15], list) {
+		if (ptype-&amp;gt;type == type &amp;amp;&amp;amp;
+		    (!ptype-&amp;gt;dev || ptype-&amp;gt;dev == skb-&amp;gt;dev)) {
+			if (pt_prev)
+				ret = deliver_skb(skb, pt_prev, orig_dev);
+			pt_prev = ptype;
+		}
+	}
+
+	if (pt_prev) {
+		ret = pt_prev-&amp;gt;func(skb, skb-&amp;gt;dev, pt_prev, orig_dev);
+	} else {
+		kfree_skb(skb);
+		/* Jamal, now you will not able to escape explaining
+		 * me how you were going to use this. :-)
+		 */
+		ret = NET_RX_DROP;
+	}
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;这段代码用来将网卡收到的报文转交给由&lt;code class=&quot;highlighter-rouge&quot;&gt;struct packet_type&lt;/code&gt;结构表示的网络层协议。&lt;/p&gt;
+
+&lt;p&gt;相信每一个初次读到这段代码的人，都会有这样一个疑惑，为什么不将代码写成如下形式：&lt;/p&gt;
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;list_for_each_entry_rcu(ptype, &amp;amp;ptype_base[ntohs(type)&amp;amp;15], list) {
+		if (ptype-&amp;gt;type == type &amp;amp;&amp;amp;
+		    (!ptype-&amp;gt;dev || ptype-&amp;gt;dev == skb-&amp;gt;dev)) {
+			ret = deliver_skb(skb, ptype, orig_dev);
+		}
+	}
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;或者:&lt;/p&gt;
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;list_for_each_entry_rcu(ptype, &amp;amp;ptype_base[ntohs(type)&amp;amp;15], list) {
+		if (ptype-&amp;gt;type == type &amp;amp;&amp;amp;
+		    (!ptype-&amp;gt;dev || ptype-&amp;gt;dev == skb-&amp;gt;dev)) {
+			ret = ptype-&amp;gt;func(skb, skb-&amp;gt;dev, pt_prev, orig_dev);
+		}
+	}
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;要回答这个问题，首先要看一下deliver_skb的实现：&lt;/p&gt;
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;static inline int deliver_skb(struct sk_buff *skb,
+			      struct packet_type *pt_prev,
+			      struct net_device *orig_dev)
+{
+	atomic_inc(&amp;amp;skb-&amp;gt;users);
+	return pt_prev-&amp;gt;func(skb, skb-&amp;gt;dev, pt_prev, orig_dev);
+}
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;其中将skb-&amp;gt;users做了一次加1操作。当skb-&amp;gt;users不为1时，在Linux内核看来，这个skb就是被共享的。在转交上层协议后，上层协议需要调用skb_clone，来“克隆”skb。例如对应于IPv4协议的数据包接收函数 ip_rcv中有以下代码：&lt;/p&gt;
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;……
+if ((skb = skb_share_check(skb, GFP_ATOMIC)) == NULL) {
+		IP_INC_STATS_BH(IPSTATS_MIB_INDISCARDS);
+		goto out;
+	}
+……
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;其中 &lt;code class=&quot;highlighter-rouge&quot;&gt;skb_share_check&lt;/code&gt; 的实现如下：&lt;/p&gt;
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;static inline struct sk_buff *skb_share_check(struct sk_buff *skb,
+					      gfp_t pri)
+{
+	might_sleep_if(pri &amp;amp; __GFP_WAIT);
+	if (skb_shared(skb)) {
+		struct sk_buff *nskb = skb_clone(skb, pri);
+		kfree_skb(skb);
+		skb = nskb;
+	}
+	return skb;
+}
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;从if条件判断可以看出，如果该skb没有被共享，返回原始skb，而如果是被共享的状态，会返回克隆后的报文&lt;/p&gt;
+
+&lt;p&gt;果然其中的 &lt;code class=&quot;highlighter-rouge&quot;&gt;skb_shared&lt;/code&gt;函数就是依据&lt;code class=&quot;highlighter-rouge&quot;&gt;skb-&amp;gt;users&lt;/code&gt;的数值是否为1来判断该报文是否被共享,:&lt;/p&gt;
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;
+/**
+ *	skb_shared - is the buffer shared
+ *	@skb: buffer to check
+ *
+ *	Returns true if more than one person has a reference to this
+ *	buffer.
+ */
+static inline int skb_shared(const struct sk_buff *skb)
+{
+	return atomic_read(&amp;amp;skb-&amp;gt;users) != 1;
+}
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;由此，可以看出Linux内核这么写的好处是优化了最common的情况：也就是该报文只对应一个handler。这样会在第一次找到合适的 ptype 时将它保存在pt_prev中，而不是直接调用deliver_skb，在其中进行users加1的操作，并引发无谓的skb clone操作。(比我们想改成的第一种写法好)&lt;/p&gt;
+
+&lt;p&gt;而同时也能适应一个skb，对应多个 ptype 的情况，保证在for循环内会调用(n-1)次deliver_skb，将对应的users计数设置到一个合理的值。并且也不遗漏最后一个匹配的ptype，因为它被放到了pt_prev中，在for循环后调用它的func函数。(比第二种写法好)&lt;/p&gt;
+
+&lt;p&gt;本文为作者的学习心得，如果有错误或者你有什么疑惑不清的地方，欢迎留言，来信交流。感谢阅读！&lt;/p&gt;
+
+&lt;p&gt;参考链接：https://www.cnblogs.com/yizhinantian/archive/2012/09/21/2696573.html&lt;/p&gt;
+</description>
+        <pubDate>Sat, 17 Aug 2019 16:50:45 +0800</pubDate>
+        <link>/%E9%98%85%E8%AF%BB%E6%BA%90%E7%A0%81%E5%B0%8F%E7%BB%93/</link>
+        <guid isPermaLink="true">/%E9%98%85%E8%AF%BB%E6%BA%90%E7%A0%81%E5%B0%8F%E7%BB%93/</guid>
+        
+        
+        <category>Linux</category>
+        
+      </item>
+    
+      <item>
+        <title>分析Linux系统调用-开篇</title>
+        <description>&lt;p&gt;在不同类型的操作系统上，系统调用都是内核给用户态的应用程序提供操作原语最主要的方式。虽然Linux内核在此基础上还有其他的途径来给用户程序提供一些接口(例如proc文件系统，netlink)，但也或多或少地依赖了系统调用。所以对Linux系统调用的实现进行分析，打开这个黑盒子，能进一步了解其底层实现，进而将一些操作系统概念与真实世界的实作联系起来，甚至能发现许多手册上没有提到，或者表述不清的地方(毕竟手册上的东西更多表述的是抽象接口，但为了保证后续的稳定性，请不要过度依赖这些从实现角度得到的特性)！况且，这件事本身也非常有意思！&lt;/p&gt;
+
+&lt;p&gt;在这一系列的文章中，分析的对象为Linux的4.4版本内核。可以下载一份对应的源码进行学习。&lt;/p&gt;
 
 &lt;p&gt;首先，你不能分析一个你看不见的东西。而在Linux内核的较高版本上，已经将通过宏定义的方式来声明系统调用。
 老版本(2.6.24)如下：&lt;/p&gt;
@@ -31,9 +144,75 @@
 &lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
 &lt;p&gt;这样的形式。&lt;/p&gt;
 
-&lt;p&gt;其中的SYSCALL_DEFINE1是用于生成只有一个参数的系统调用声明，该宏展开后所对应的代码形式类似于老版本的样子。&lt;/p&gt;
+&lt;p&gt;其中SYSCALL_DEFINE1在include/linux/syscalls.h中的实现为&lt;/p&gt;
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;#define SYSCALL_DEFINE1(name, ...) SYSCALL_DEFINEx(1, _##name, __VA_ARGS__)
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;SYSCALL_DEFINEx实现为:&lt;/p&gt;
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;#define SYSCALL_DEFINEx(x, sname, ...)				\
+	SYSCALL_METADATA(sname, x, __VA_ARGS__)			\
+	__SYSCALL_DEFINEx(x, sname, __VA_ARGS__)
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;将x=1,sname=_alarm(注意&lt;code class=&quot;highlighter-rouge&quot;&gt;##name&lt;/code&gt;前的下划线)带入扩展，可得：&lt;/p&gt;
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;SYSCALL_METADATA(_alarm, 1, unsigned int,seconds)
+__SYSCALL_DEFINEx(1, _alarm,  unsigned int,seconds)
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;其中SYSCALL_METADATA宏依据CONFIG_FTRACE_SYSCALLS的编译选项来扩展，用以支持ftrace机制。如果没有启用FRACE则扩展为一个空宏。
+继续看__SYSCALL_DEFINEx的实现：&lt;/p&gt;
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;#define __SYSCALL_DEFINEx(x, name, ...)					\
+	asmlinkage long sys##name(__MAP(x,__SC_DECL,__VA_ARGS__))	\
+		__attribute__((alias(__stringify(SyS##name))));		\
+	static inline long SYSC##name(__MAP(x,__SC_DECL,__VA_ARGS__));	\
+	asmlinkage long SyS##name(__MAP(x,__SC_LONG,__VA_ARGS__));	\
+	asmlinkage long SyS##name(__MAP(x,__SC_LONG,__VA_ARGS__))	\
+	{								\
+		long ret = SYSC##name(__MAP(x,__SC_CAST,__VA_ARGS__));	\
+		__MAP(x,__SC_TEST,__VA_ARGS__);				\
+		__PROTECT(x, ret,__MAP(x,__SC_ARGS,__VA_ARGS__));	\
+		return ret;						\
+	}								\
+	static inline long SYSC##name(__MAP(x,__SC_DECL,__VA_ARGS__))
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
 
-&lt;p&gt;虽然这样做在软件工程的角度讲可以将系统调用的声明方式归拢到一处(宏定义处)，但这阻碍了很多代码分析工具(source insight,visual studio code)对系统调用的正常识别：会将系统调用当成一个宏的参数，而不是一个函数。这样会影响我们对系统调用实现函数的定位。&lt;/p&gt;
+&lt;p&gt;按传入参数扩展可得：&lt;/p&gt;
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;asmlinkage long sys_alarm(unsigned int seconds)
+    __attribute__((alias(__stringify(SyS_alarm))));
+static inline long SYSC_alarm(unsigned int seconds);
+
+asmlinkage long SyS_alarm(long seconds);
+asmlinkage long SyS_alarm(long seconds)
+{
+  long ret = SYSC_alarm((unsigned int)seconds);
+  BUILD_BUG_ON_ZERO(sizeof(unsigned int) &amp;gt; sizeof(long));
+   __PROTECT(1, ret, seconds);
+   return ret;	
+}
+static inline long SYSC_alarm(unsigned int seconds);
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;其中__MAP用于生成形参列表，__stringify就是 把  x 直接转换为字符串。其返回值就是字符串，而不是变量名。&lt;/p&gt;
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;#define __MAP0(m,...)
+#define __MAP1(m,t,a) m(t,a)
+#define __MAP2(m,t,a,...) m(t,a), __MAP1(m,__VA_ARGS__)
+#define __MAP3(m,t,a,...) m(t,a), __MAP2(m,__VA_ARGS__)
+#define __MAP4(m,t,a,...) m(t,a), __MAP3(m,__VA_ARGS__)
+#define __MAP5(m,t,a,...) m(t,a), __MAP4(m,__VA_ARGS__)
+#define __MAP6(m,t,a,...) m(t,a), __MAP5(m,__VA_ARGS__)
+#define __MAP(n,...) __MAP##n(__VA_ARGS__)
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;#define __SC_DECL(t, a) t a
+#define __SC_LONG(t, a) __typeof(__builtin_choose_expr(__TYPE_IS_LL(t), 0LL, 0L)) a
+#define __SC_CAST(t, a) (t) a
+#define __SC_ARGS(t, a) a
+#define __SC_TEST(t, a) (void)BUILD_BUG_ON_ZERO(!__TYPE_IS_LL(t) &amp;amp;&amp;amp; sizeof(t) &amp;gt; sizeof(long))
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;#define __stringify_1(x...)	#x
+#define __stringify(x...)	__stringify_1(x)
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;可见SYSCALL_DEFINE1是用于生成只有一个参数的系统调用声明，该宏展开后声明的函数SYSC_alarm类似于老版本内核的sys_alarm。&lt;/p&gt;
+
+&lt;p&gt;虽然这样做在软件工程的角度讲可以将系统调用的声明方式归拢到一处(宏定义处)，并易于扩展。但这同时阻碍了很多代码分析工具(source insight,visual studio code)对系统调用的正常识别：会将系统调用当成一个宏的参数，而不是一个函数。这样会影响我们对系统调用实现函数的定位。&lt;/p&gt;
 
 &lt;p&gt;我目前对该问题的解决方案是，利用这些系统调用声明宏都是以&lt;code class=&quot;highlighter-rouge&quot;&gt;SYSCALL_DEFINE&lt;/code&gt;开头的特点，通过文本编辑器(如sublime text)或者grep来在Linux内核项目中找到所有&lt;code class=&quot;highlighter-rouge&quot;&gt;SYSCALL_DEFINE&lt;/code&gt;出现的地方，就可以定位到所有系统调用声明处了(虽然会有些不是地方，例如文档中，但极少)。如果你有更好的方法，欢迎留言探讨。&lt;/p&gt;
 
@@ -60,11 +239,11 @@
 
 &lt;p&gt;在本系列文章中，将会聚焦于系统调用的具体实现，站在内核的角度进行描述，假定用户程序已经通过某种机制将系统调用要用到的参数传递到内核中。暂时不会讲述与系统调用实现相关的体系结构相关的知识，例如如何传递调用参数，如何进行特权级切换等。虽然这些内容同样非常重要，但十分依赖具体的硬件架构，而且网上也有很多不错的相关资料。后面如有需要，会加以补充x86-64平台上的实现方式。&lt;/p&gt;
 
-&lt;p&gt;在接下来的文章中，我会具体从易到难地讲述每个系统调用的实现方式。对涉及更下层次的具体实现(例如VFS方面)，本系列文章会暂时&lt;code class=&quot;highlighter-rouge&quot;&gt;浅尝辄止&lt;/code&gt;,不会深入进去。而会另开一些列文章进行叙述。保证这一些列文章都在一个大致相似的实现层次。&lt;/p&gt;
+&lt;p&gt;在接下来的文章中，我会具体从易到难地讲述几十个经典系统调用的实现方式。对涉及更下层次的具体实现(例如VFS方面)，本系列文章会暂时&lt;code class=&quot;highlighter-rouge&quot;&gt;浅尝辄止&lt;/code&gt;,不会深入进去。而会另开一些列文章进行叙述。保证这一些列文章都在一个大致相似的实现层次。&lt;/p&gt;
 
 &lt;p&gt;在本系列文章的写作中，势必会引用很多书籍，网上的资料。在此先提前感谢！&lt;/p&gt;
 
-&lt;p&gt;如有任何疑问，欢迎留言反馈。也可以给我发email:2927098@qq.com&lt;/p&gt;
+&lt;p&gt;我也相信我的文章中也会有不少谬误，如有任何疑问，欢迎留言反馈。也可以给我发email:2927098@qq.com&lt;/p&gt;
 </description>
         <pubDate>Sat, 17 Aug 2019 16:50:45 +0800</pubDate>
         <link>/%E5%88%86%E6%9E%90Linux%E7%B3%BB%E7%BB%9F%E8%B0%83%E7%94%A8(1)/</link>
